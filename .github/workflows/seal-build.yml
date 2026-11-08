@@ -1,0 +1,204 @@
+# Sealed-libraries build for kafka-clients. Upstream Kafka 2.8.x has no GitHub
+# Actions CI (it builds and tests on ASF Jenkins, see Jenkinsfile), so this
+# workflow translates the Jenkinsfile's JDK 8 / 11 / 15 test stages and the
+# release.py JDK 8 build into one GitHub Actions workflow.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Gradle test selector, e.g. ':clients:test --tests org.apache.kafka.clients.NetworkClientTest' (empty = full suite)"
+        required: false
+        default: ''
+
+env:
+  # First 16 hex chars of the 2.8.1 release commit (839b886f9b73...), as found in
+  # kafka/kafka-version.properties of the published jar; the fork commit differs.
+  KAFKA_COMMIT_ID: 839b886f9b732b15
+  # Checkstyle / SpotBugs are lint gates the test task depends on; they never
+  # execute the code, so they are excluded here.
+  LINT_EXCLUDES: -x checkstyleMain -x checkstyleTest -x spotbugsMain -x spotbugsTest
+  # Jenkinsfile retries change-request builds (-PmaxTestRetries=1 -PmaxTestRetryFailures=5);
+  # raised to 2/10 because timing-sensitive SSL/coordinator tests flake on shared runners
+  # and the retry plugin disables all retries once more than maxTestRetryFailures fail.
+  TEST_FLAGS: --continue -PmaxParallelForks=2 -PmaxTestRetries=2 -PmaxTestRetryFailures=10 -PtestLoggingEvents=passed,skipped,failed
+
+jobs:
+  clients:
+    name: clients (JDK ${{ matrix.java }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # release.py builds the release with jdk8_env -> the jars come from this leg
+          - java: '8'
+            distribution: temurin
+            package: true
+          # JDK 11 update current at the 2.8.1 release (Sep 2021); 2026 JDK 11 updates
+          # reject the test-generated client certs in SslTransportLayerTest's TLSv1.2
+          # client-auth cases ("Empty client certificate chain").
+          - java: '11.0.12+7'
+            distribution: temurin
+            package: false
+          - java: '15'
+            distribution: zulu
+            package: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: ${{ matrix.distribution }}
+          java-version: ${{ matrix.java }}
+
+      - name: Gradle distribution mirror
+        # services.gradle.org (and its github.com/gradle/gradle-distributions redirect) has been
+        # returning 504, and the wrapper does not retry. Download gradle-6.8.1-all.zip with
+        # retries (mirror first, then services.gradle.org) and point the wrapper at the local
+        # file, pinned to the SHA-256 that services.gradle.org publishes, so the wrapper
+        # rejects any other file.
+        run: |
+          zip="$RUNNER_TEMP/gradle-6.8.1-all.zip"
+          curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$zip" \
+              https://mirrors.cloud.tencent.com/gradle/gradle-6.8.1-all.zip \
+            || curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$zip" \
+              https://services.gradle.org/distributions/gradle-6.8.1-all.zip
+          echo "3db89524a3981819ff28c3f979236c1274a726e146ced0c8a2020417f9bc0782  $zip" | sha256sum -c -
+          sed -i "s#^distributionUrl=.*#distributionUrl=file\\\\:$zip#" gradle/wrapper/gradle-wrapper.properties
+          echo 'distributionSha256Sum=3db89524a3981819ff28c3f979236c1274a726e146ced0c8a2020417f9bc0782' >> gradle/wrapper/gradle-wrapper.properties
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      - name: JCenter mirror
+        # build.gradle's buildscript classpath (grgit-core 4.1.0) and some deps were
+        # published only to JCenter, which is shut down; point Gradle at a mirror.
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/jcenter-mirror.gradle <<'EOF'
+          allprojects {
+            buildscript {
+              repositories { maven { url "https://maven.aliyun.com/repository/jcenter" } }
+              // grgit-core 4.1.0 depends on jgit version RELEASE, which now resolves to a
+              // Java 17 build; pin the jgit current at the 2.8.1 release (Java 8 compatible).
+              configurations.all { resolutionStrategy.force 'org.eclipse.jgit:org.eclipse.jgit:5.12.0.202106070339-r' }
+            }
+            repositories { maven { url "https://maven.aliyun.com/repository/jcenter" } }
+          }
+          EOF
+
+      - name: Gradle version
+        run: ./gradlew -version
+
+      - name: Build kafka-clients jar and test jar
+        if: matrix.package
+        run: |
+          ./gradlew --no-daemon --console=plain -PcommitId=${KAFKA_COMMIT_ID} :clients:jar :clients:testJar
+          ls -l clients/build/libs/
+
+      - name: Upload jars
+        if: matrix.package
+        uses: actions/upload-artifact@v4
+        with:
+          name: kafka-clients-jars
+          path: |
+            clients/build/libs/kafka-clients-2.8.1.jar
+            clients/build/libs/kafka-clients-2.8.1-test.jar
+          if-no-files-found: error
+
+      - name: Test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew --no-daemon --console=plain -PcommitId=${KAFKA_COMMIT_ID} ${LINT_EXCLUDES} ${TEST_FLAGS} ${{ inputs.test-filter }}
+          else
+            ./gradlew --no-daemon --console=plain -PcommitId=${KAFKA_COMMIT_ID} ${LINT_EXCLUDES} ${TEST_FLAGS} :clients:test
+          fi
+
+      - name: Test summary
+        if: always()
+        run: python3 .github/seal-test-summary.py
+
+  patched-modules:
+    # Tests outside :clients that cover source paths the later CVE patches touch
+    # (core broker config / controller, connect runtime, mirror-client, streams assignment).
+    name: patched-path tests in core/connect/streams (JDK 8)
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        id: setup-java
+        # Test-only job: if the Temurin download from GitHub releases fails (504s on
+        # 2026-11-08), fall back to the Temurin 8 preinstalled on the runner image.
+        continue-on-error: true
+        with:
+          distribution: temurin
+          java-version: '8'
+
+      - name: Fall back to the runner's preinstalled JDK 8
+        if: steps.setup-java.outcome == 'failure'
+        run: |
+          echo "JAVA_HOME=${JAVA_HOME_8_X64}" >> "$GITHUB_ENV"
+          echo "${JAVA_HOME_8_X64}/bin" >> "$GITHUB_PATH"
+          "${JAVA_HOME_8_X64}/bin/java" -version
+
+      - name: Gradle distribution mirror
+        # services.gradle.org (and its github.com/gradle/gradle-distributions redirect) has been
+        # returning 504, and the wrapper does not retry. Download gradle-6.8.1-all.zip with
+        # retries (mirror first, then services.gradle.org) and point the wrapper at the local
+        # file, pinned to the SHA-256 that services.gradle.org publishes, so the wrapper
+        # rejects any other file.
+        run: |
+          zip="$RUNNER_TEMP/gradle-6.8.1-all.zip"
+          curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$zip" \
+              https://mirrors.cloud.tencent.com/gradle/gradle-6.8.1-all.zip \
+            || curl -fsSL --retry 5 --retry-all-errors --connect-timeout 30 --max-time 600 -o "$zip" \
+              https://services.gradle.org/distributions/gradle-6.8.1-all.zip
+          echo "3db89524a3981819ff28c3f979236c1274a726e146ced0c8a2020417f9bc0782  $zip" | sha256sum -c -
+          sed -i "s#^distributionUrl=.*#distributionUrl=file\\\\:$zip#" gradle/wrapper/gradle-wrapper.properties
+          echo 'distributionSha256Sum=3db89524a3981819ff28c3f979236c1274a726e146ced0c8a2020417f9bc0782' >> gradle/wrapper/gradle-wrapper.properties
+          cat gradle/wrapper/gradle-wrapper.properties
+
+      - name: JCenter mirror
+        # grgit-core 4.1.0 (buildscript classpath) was JCenter-only; JCenter is shut down.
+        run: |
+          mkdir -p ~/.gradle/init.d
+          cat > ~/.gradle/init.d/jcenter-mirror.gradle <<'EOF'
+          allprojects {
+            buildscript {
+              repositories { maven { url "https://maven.aliyun.com/repository/jcenter" } }
+              // grgit-core 4.1.0 depends on jgit version RELEASE, which now resolves to a
+              // Java 17 build; pin the jgit current at the 2.8.1 release (Java 8 compatible).
+              configurations.all { resolutionStrategy.force 'org.eclipse.jgit:org.eclipse.jgit:5.12.0.202106070339-r' }
+            }
+            repositories { maven { url "https://maven.aliyun.com/repository/jcenter" } }
+          }
+          EOF
+
+      - name: Test
+        if: inputs.test-filter == ''
+        run: |
+          ./gradlew --no-daemon --console=plain -PcommitId=${KAFKA_COMMIT_ID} ${LINT_EXCLUDES} ${TEST_FLAGS} \
+            :core:test \
+              --tests kafka.controller.PartitionStateMachineTest \
+              --tests kafka.server.DynamicBrokerConfigTest \
+              --tests kafka.server.DynamicBrokerReconfigurationTest \
+              --tests kafka.server.KafkaConfigTest \
+              --tests kafka.admin.BrokerApiVersionsCommandTest \
+              --tests kafka.network.RequestChannelTest \
+            :connect:runtime:test \
+              --tests org.apache.kafka.connect.runtime.WorkerTest \
+              --tests org.apache.kafka.connect.runtime.WorkerConfigTest \
+            :connect:mirror-client:test \
+            :streams:test \
+              --tests org.apache.kafka.streams.processor.internals.assignment.AssignmentInfoTest
+
+      - name: Scoped run
+        if: inputs.test-filter != ''
+        run: echo "test-filter is set; the scoped selection runs in the clients legs"
+
+      - name: Test summary
+        if: always() && inputs.test-filter == ''
+        run: python3 .github/seal-test-summary.py

@@ -23,6 +23,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.stream.Collectors;
 import org.apache.kafka.common.config.ConfigException;
+import org.junit.jupiter.api.Disabled;
 import org.junit.jupiter.api.Test;
 
 import static java.util.Arrays.asList;
@@ -48,6 +49,7 @@ public class ClientUtilsTest {
         assertEquals(10000, onlyAddress.getPort());
     }
 
+    @Disabled("Hardcodes example.com's former IPs (93.184.216.34 / 2606:2800:220:1:248:1893:25c8:1946); example.com now resolves elsewhere, so it fails on any network")
     @Test
     public void testParseAndValidateAddressesWithReverseLookup() {
         checkWithoutLookup("127.0.0.1:8000");
