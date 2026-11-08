@@ -27,14 +27,20 @@ import java.io.File;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 import static java.util.Arrays.asList;
+import static org.apache.kafka.common.config.provider.DirectoryConfigProvider.ALLOWED_PATHS_CONFIG;
 import static org.apache.kafka.test.TestUtils.toSet;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class DirectoryConfigProviderTest {
@@ -144,6 +150,78 @@ public class DirectoryConfigProviderTest {
         ConfigData configData = provider.get(null, Collections.singleton("foo"));
         assertTrue(configData.data().isEmpty());
         assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testAllowedPath() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, parent.getAbsolutePath());
+        provider.configure(configs);
+
+        ConfigData configData = provider.get(dir.getAbsolutePath());
+        assertEquals(toSet(asList(foo.getName(), bar.getName())), configData.data().keySet());
+        assertEquals("FOO", configData.data().get(foo.getName()));
+        assertEquals("BAR", configData.data().get(bar.getName()));
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testMultipleAllowedPaths() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir.getAbsolutePath() + "," + siblingDir.getAbsolutePath());
+        provider.configure(configs);
+
+        ConfigData configData = provider.get(subdir.getAbsolutePath());
+        assertEquals(toSet(asList(subdirFile.getName())), configData.data().keySet());
+        assertEquals("SUBDIRFILE", configData.data().get(subdirFile.getName()));
+        assertNull(configData.ttl());
+
+        configData = provider.get(siblingDir.getAbsolutePath());
+        assertEquals(toSet(asList(siblingDirFile.getName())), configData.data().keySet());
+        assertEquals("SIBLINGDIRFILE", configData.data().get(siblingDirFile.getName()));
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNotAllowedPath() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir.getAbsolutePath());
+        provider.configure(configs);
+
+        ConfigData configData = provider.get(siblingDir.getAbsolutePath());
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNoTraversalAllowedPath() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir.getAbsolutePath());
+        provider.configure(configs);
+
+        ConfigData configData = provider.get(Paths.get(dir.getAbsolutePath(), "..", siblingDir.getName()).toString());
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNoSymlinkEscapeAllowedPath() throws IOException {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir.getAbsolutePath());
+        provider.configure(configs);
+
+        // A symlink inside the allowed directory must not give access to a directory outside of it
+        Path symlink = Files.createSymbolicLink(Paths.get(dir.getAbsolutePath(), "link"), siblingDir.toPath());
+        ConfigData configData = provider.get(symlink.toString());
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNonConfiguredProvider() {
+        DirectoryConfigProvider provider2 = new DirectoryConfigProvider();
+        IllegalStateException ise = assertThrows(IllegalStateException.class, () -> provider2.get(Paths.get(dir.getAbsolutePath()).toString()));
+        assertEquals("The provider has not been configured yet.", ise.getMessage());
     }
 }
 

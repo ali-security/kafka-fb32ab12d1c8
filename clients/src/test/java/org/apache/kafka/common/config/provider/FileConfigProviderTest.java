@@ -19,25 +19,51 @@ package org.apache.kafka.common.config.provider;
 import org.apache.kafka.common.config.ConfigData;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 
+import java.io.File;
 import java.io.IOException;
 import java.io.Reader;
 import java.io.StringReader;
+import java.io.UncheckedIOException;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
+import static org.apache.kafka.common.config.provider.DirectoryConfigProvider.ALLOWED_PATHS_CONFIG;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FileConfigProviderTest {
 
     private FileConfigProvider configProvider;
+    @TempDir
+    public File parent;
+    private String dir;
+    private String dirFile;
+    private String siblingDir;
+    private String siblingDirFile;
 
     @BeforeEach
     public void setup() {
         configProvider = new TestFileConfigProvider();
+        configProvider.configure(Collections.emptyMap());
+
+        try {
+            dir = Files.createDirectory(Paths.get(parent.toString(), "dir")).toString();
+            dirFile = Files.createFile(Paths.get(dir, "dirFile")).toString();
+
+            siblingDir = Files.createDirectory(Paths.get(parent.toString(), "siblingDir")).toString();
+            siblingDirFile = Files.createFile(Paths.get(siblingDir, "siblingDirFile")).toString();
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
     }
 
     @Test
@@ -93,5 +119,126 @@ public class FileConfigProviderTest {
         protected Reader reader(String path) throws IOException {
             return new StringReader("testKey=testResult\ntestKey2=testResult2");
         }
+    }
+
+    @Test
+    public void testAllowedDirPath() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir);
+        configProvider.configure(configs);
+
+        ConfigData configData = configProvider.get(dirFile);
+        Map<String, String> result = new HashMap<>();
+        result.put("testKey", "testResult");
+        result.put("testKey2", "testResult2");
+        assertEquals(result, configData.data());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testAllowedFilePath() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dirFile);
+        configProvider.configure(configs);
+
+        ConfigData configData = configProvider.get(dirFile);
+        Map<String, String> result = new HashMap<>();
+        result.put("testKey", "testResult");
+        result.put("testKey2", "testResult2");
+        assertEquals(result, configData.data());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testMultipleAllowedPaths() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir + "," + siblingDir);
+        configProvider.configure(configs);
+
+        Map<String, String> result = new HashMap<>();
+        result.put("testKey", "testResult");
+        result.put("testKey2", "testResult2");
+
+        ConfigData configData = configProvider.get(dirFile);
+        assertEquals(result, configData.data());
+        assertNull(configData.ttl());
+
+        configData = configProvider.get(siblingDirFile);
+        assertEquals(result, configData.data());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNotAllowedDirPath() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir);
+        configProvider.configure(configs);
+
+        ConfigData configData = configProvider.get(siblingDirFile);
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNotAllowedFilePath() throws IOException {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dirFile);
+        configProvider.configure(configs);
+
+        //another file under the same directory
+        Path dirFile2 = Files.createFile(Paths.get(dir, "dirFile2"));
+        ConfigData configData = configProvider.get(dirFile2.toString());
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNoTraversal() {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dirFile);
+        configProvider.configure(configs);
+
+        // Check we can't escape outside the path directory
+        ConfigData configData = configProvider.get(Paths.get(dirFile, "..", "..", "siblingDir", "siblingDirFile").toString());
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testNoSymlinkEscape() throws IOException {
+        Map<String, String> configs = new HashMap<>();
+        configs.put(ALLOWED_PATHS_CONFIG, dir);
+        configProvider.configure(configs);
+
+        // A symlink inside the allowed directory must not give access to a file outside of it
+        Path symlink = Files.createSymbolicLink(Paths.get(dir, "link"), Paths.get(siblingDirFile));
+        ConfigData configData = configProvider.get(symlink.toString());
+        assertTrue(configData.data().isEmpty());
+        assertNull(configData.ttl());
+    }
+
+    @Test
+    public void testAllowedPathWithDefaultReader() throws IOException {
+        Files.write(Paths.get(dirFile), "testKey=dirFileValue".getBytes(StandardCharsets.UTF_8));
+        Files.write(Paths.get(siblingDirFile), "testKey=siblingDirFileValue".getBytes(StandardCharsets.UTF_8));
+        Path symlink = Files.createSymbolicLink(Paths.get(dir, "link"), Paths.get(siblingDirFile));
+
+        FileConfigProvider provider = new FileConfigProvider();
+        provider.configure(Collections.singletonMap(ALLOWED_PATHS_CONFIG, dir));
+
+        assertEquals(Collections.singletonMap("testKey", "dirFileValue"), provider.get(dirFile).data());
+        assertEquals(Collections.singletonMap("testKey", "dirFileValue"),
+                provider.get(dirFile, Collections.singleton("testKey")).data());
+        assertTrue(provider.get(siblingDirFile).data().isEmpty());
+        assertTrue(provider.get(siblingDirFile, Collections.singleton("testKey")).data().isEmpty());
+        assertTrue(provider.get(symlink.toString()).data().isEmpty());
+        assertTrue(provider.get(symlink.toString(), Collections.singleton("testKey")).data().isEmpty());
+    }
+
+    @Test
+    public void testNonConfiguredProvider() {
+        FileConfigProvider provider2 = new FileConfigProvider();
+        IllegalStateException ise = assertThrows(IllegalStateException.class, () -> provider2.get(Paths.get(dirFile).toString()));
+        assertEquals("The provider has not been configured yet.", ise.getMessage());
     }
 }
