@@ -44,6 +44,7 @@ import org.apache.kafka.common.message.AlterReplicaLogDirsRequestData;
 import org.apache.kafka.common.message.AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopic;
 import org.apache.kafka.common.message.AlterReplicaLogDirsRequestData.AlterReplicaLogDirTopicCollection;
 import org.apache.kafka.common.message.AlterReplicaLogDirsResponseData;
+import org.apache.kafka.common.message.AlterUserScramCredentialsRequestData;
 import org.apache.kafka.common.message.ApiMessageType;
 import org.apache.kafka.common.message.ApiVersionsRequestData;
 import org.apache.kafka.common.message.ApiVersionsResponseData;
@@ -201,6 +202,7 @@ import org.junit.jupiter.api.Test;
 
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -223,6 +225,7 @@ import static org.apache.kafka.common.protocol.ApiKeys.LIST_GROUPS;
 import static org.apache.kafka.common.protocol.ApiKeys.LIST_OFFSETS;
 import static org.apache.kafka.common.protocol.ApiKeys.SYNC_GROUP;
 import static org.apache.kafka.common.requests.FetchMetadata.INVALID_SESSION_ID;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
@@ -2237,7 +2240,7 @@ public class RequestResponseTest {
     }
 
     private AlterConfigsRequest createAlterConfigsRequest() {
-        Map<ConfigResource, AlterConfigsRequest.Config> configs = new HashMap<>();
+        Map<ConfigResource, AlterConfigsRequest.Config> configs = new LinkedHashMap<>();
         List<AlterConfigsRequest.ConfigEntry> configEntries = asList(
                 new AlterConfigsRequest.ConfigEntry("config_name", "config_value"),
                 new AlterConfigsRequest.ConfigEntry("another_name", "another value")
@@ -2245,7 +2248,19 @@ public class RequestResponseTest {
         configs.put(new ConfigResource(ConfigResource.Type.BROKER, "0"), new AlterConfigsRequest.Config(configEntries));
         configs.put(new ConfigResource(ConfigResource.Type.TOPIC, "topic"),
                 new AlterConfigsRequest.Config(Collections.<AlterConfigsRequest.ConfigEntry>emptyList()));
-        return new AlterConfigsRequest.Builder(configs, false).build((short) 0);
+        AlterConfigsRequest alterConfigsRequest = new AlterConfigsRequest.Builder(configs, false).build((short) 0);
+        assertEquals(
+                "AlterConfigsRequestData(resources=[" +
+                        "AlterConfigsResource(resourceType=" + ConfigResource.Type.BROKER.id() + ", " +
+                        "resourceName='0', " +
+                        "configs=[AlterableConfig(name='config_name', value='REDACTED'), " +
+                        "AlterableConfig(name='another_name', value='REDACTED')]), " +
+                        "AlterConfigsResource(resourceType=" + ConfigResource.Type.TOPIC.id() + ", " +
+                        "resourceName='topic', configs=[])], " +
+                        "validateOnly=false)",
+                alterConfigsRequest.toString()
+        );
+        return alterConfigsRequest;
     }
 
     private AlterConfigsResponse createAlterConfigsResponse() {
@@ -2348,7 +2363,12 @@ public class RequestResponseTest {
                 .setMaxTimestampMs(System.currentTimeMillis())
                 .setTokenId("token1")
                 .setHmac("test".getBytes());
-        return new CreateDelegationTokenResponse(data);
+        CreateDelegationTokenResponse response = new CreateDelegationTokenResponse(data);
+
+        String responseStr = response.toString();
+        assertTrue(responseStr.contains("tokenId='REDACTED'"));
+        assertTrue(responseStr.contains("hmac=[]"));
+        return response;
     }
 
     private RenewDelegationTokenRequest createRenewTokenRequest() {
@@ -2404,7 +2424,14 @@ public class RequestResponseTest {
         tokenList.add(new DelegationToken(tokenInfo1, "test".getBytes()));
         tokenList.add(new DelegationToken(tokenInfo2, "test".getBytes()));
 
-        return new DescribeDelegationTokenResponse(20, Errors.NONE, tokenList);
+        DescribeDelegationTokenResponse response = new DescribeDelegationTokenResponse(20, Errors.NONE, tokenList);
+
+        String responseStr = response.toString();
+        String[] parts = responseStr.split(",");
+        // The 2 token info should both be redacted
+        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("tokenId='REDACTED'")).count());
+        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("hmac=[]")).count());
+        return response;
     }
 
     private ElectLeadersRequest createElectLeadersRequestNullPartitions() {
@@ -2758,5 +2785,229 @@ public class RequestResponseTest {
         assertEquals(Integer.valueOf(1), createTxnOffsetCommitResponse().errorCounts().get(Errors.NONE));
         assertEquals(Integer.valueOf(1), createUpdateMetadataResponse().errorCounts().get(Errors.NONE));
         assertEquals(Integer.valueOf(1), createWriteTxnMarkersResponse().errorCounts().get(Errors.NONE));
+    }
+
+    @Test
+    public void testSaslAuthenticateRequestResponseToStringMasksSensitiveData() {
+        byte[] sensitiveAuthBytes = "sensitive-auth-token-123".getBytes(StandardCharsets.UTF_8);
+        SaslAuthenticateRequestData requestData = new SaslAuthenticateRequestData().setAuthBytes(sensitiveAuthBytes);
+        SaslAuthenticateRequest request = new SaslAuthenticateRequest(requestData, ApiKeys.SASL_AUTHENTICATE.latestVersion());
+
+        // Verify that the authBytes field is present but empty in the output
+        for (String requestString : asList(request.toString(), request.toString(false))) {
+            assertTrue(requestString.contains("authBytes=[]"),
+                    "authBytes field should be empty in toString() output");
+            assertFalse(requestString.contains(Arrays.toString(sensitiveAuthBytes)),
+                    "authBytes should not be in toString() output");
+        }
+        // The request data and the data sent on the wire are not masked
+        assertArrayEquals(sensitiveAuthBytes, request.data().authBytes());
+        assertArrayEquals(sensitiveAuthBytes,
+                SaslAuthenticateRequest.parse(request.serialize(), request.version()).data().authBytes());
+
+        SaslAuthenticateResponseData responseData = new SaslAuthenticateResponseData().setAuthBytes(sensitiveAuthBytes);
+        SaslAuthenticateResponse response = new SaslAuthenticateResponse(responseData);
+
+        String responseString = response.toString();
+
+        // Verify that the authBytes field is present but empty in the output
+        assertTrue(responseString.contains("authBytes=[]"),
+                "authBytes field should be empty in toString() output");
+        assertFalse(responseString.contains(Arrays.toString(sensitiveAuthBytes)),
+                "authBytes should not be in toString() output");
+        // The response data and the data sent on the wire are not masked
+        assertArrayEquals(sensitiveAuthBytes, response.saslAuthBytes());
+        for (short version = ApiKeys.SASL_AUTHENTICATE.oldestVersion(); version <= ApiKeys.SASL_AUTHENTICATE.latestVersion(); version++) {
+            assertArrayEquals(sensitiveAuthBytes,
+                    SaslAuthenticateResponse.parse(response.serialize(version), version).saslAuthBytes());
+        }
+    }
+
+    @Test
+    public void testAlterConfigsRequestToStringMasksConfigValues() {
+        String secret = "secret-password-value";
+        Map<ConfigResource, AlterConfigsRequest.Config> configs = Collections.singletonMap(
+                new ConfigResource(ConfigResource.Type.BROKER, "0"),
+                new AlterConfigsRequest.Config(asList(
+                        new AlterConfigsRequest.ConfigEntry("ssl.keystore.password", secret),
+                        new AlterConfigsRequest.ConfigEntry("sasl.jaas.config", secret))));
+        AlterConfigsRequest.Builder builder = new AlterConfigsRequest.Builder(configs, true);
+
+        for (short version = ApiKeys.ALTER_CONFIGS.oldestVersion(); version <= ApiKeys.ALTER_CONFIGS.latestVersion(); version++) {
+            AlterConfigsRequest request = builder.build(version);
+            for (String str : asList(request.toString(), request.toString(true), request.toString(false))) {
+                assertTrue(str.contains("ssl.keystore.password"), "Config names should be in the request string");
+                assertTrue(str.contains("sasl.jaas.config"), "Config names should be in the request string");
+                assertTrue(str.contains("value='REDACTED'"));
+                assertFalse(str.contains(secret), "Config values should not be in the request string");
+            }
+            // The request itself and the data sent on the wire are not masked
+            for (AlterConfigsRequest.ConfigEntry entry : request.configs().values().iterator().next().entries())
+                assertEquals(secret, entry.value());
+            for (AlterConfigsRequest.ConfigEntry entry : AlterConfigsRequest.parse(request.serialize(), version)
+                    .configs().values().iterator().next().entries())
+                assertEquals(secret, entry.value());
+        }
+        assertTrue(builder.toString().contains("value='REDACTED'"));
+        assertFalse(builder.toString().contains(secret), "Config values should not be in the builder string");
+    }
+
+    @Test
+    public void testIncrementalAlterConfigsRequestToStringMasksConfigValues() {
+        String secret = "secret-password-value";
+        IncrementalAlterConfigsRequestData.AlterableConfigCollection alterableConfigs =
+                new IncrementalAlterConfigsRequestData.AlterableConfigCollection();
+        alterableConfigs.add(new AlterableConfig()
+                .setName("ssl.keystore.password")
+                .setConfigOperation((byte) 0)
+                .setValue(secret));
+        IncrementalAlterConfigsRequestData data = new IncrementalAlterConfigsRequestData().setValidateOnly(true);
+        data.resources().add(new AlterConfigsResource()
+                .setResourceName("0")
+                .setResourceType(ConfigResource.Type.BROKER.id())
+                .setConfigs(alterableConfigs));
+        IncrementalAlterConfigsRequest.Builder builder = new IncrementalAlterConfigsRequest.Builder(data);
+        String expected = "IncrementalAlterConfigsRequestData(resources=[AlterConfigsResource(resourceType=" +
+                ConfigResource.Type.BROKER.id() + ", resourceName='0', configs=[AlterableConfig(" +
+                "name='ssl.keystore.password', configOperation=0, value='REDACTED')])], validateOnly=true)";
+        assertEquals(expected, builder.toString());
+
+        for (short version = ApiKeys.INCREMENTAL_ALTER_CONFIGS.oldestVersion();
+             version <= ApiKeys.INCREMENTAL_ALTER_CONFIGS.latestVersion(); version++) {
+            IncrementalAlterConfigsRequest request = builder.build(version);
+            assertEquals(expected, request.toString());
+            assertEquals(expected, request.toString(false));
+            // The request data and the data sent on the wire are not masked
+            assertEquals(secret, request.data().resources().iterator().next().configs().iterator().next().value());
+            assertEquals(secret, IncrementalAlterConfigsRequest.parse(request.serialize(), version)
+                    .data().resources().iterator().next().configs().iterator().next().value());
+        }
+    }
+
+    @Test
+    public void testAlterUserScramCredentialsRequestToStringMasksSaltAndSaltedPassword() {
+        byte[] salt = "secret-salt".getBytes(StandardCharsets.UTF_8);
+        byte[] saltedPassword = "secret-salted-password".getBytes(StandardCharsets.UTF_8);
+        AlterUserScramCredentialsRequestData data = new AlterUserScramCredentialsRequestData()
+                .setDeletions(singletonList(new AlterUserScramCredentialsRequestData.ScramCredentialDeletion()
+                        .setName("user2")
+                        .setMechanism((byte) 1)))
+                .setUpsertions(singletonList(new AlterUserScramCredentialsRequestData.ScramCredentialUpsertion()
+                        .setName("user1")
+                        .setMechanism((byte) 1)
+                        .setIterations(4096)
+                        .setSalt(salt)
+                        .setSaltedPassword(saltedPassword)));
+        AlterUserScramCredentialsRequest.Builder builder = new AlterUserScramCredentialsRequest.Builder(data);
+        String expected = "AlterUserScramCredentialsRequestData(" +
+                "deletions=[ScramCredentialDeletion(name='user2', mechanism=1)], " +
+                "upsertions=[ScramCredentialUpsertion(name='user1', mechanism=1, iterations=4096, " +
+                "salt=[], saltedPassword=[])])";
+        assertEquals(expected, builder.toString());
+
+        for (short version = ApiKeys.ALTER_USER_SCRAM_CREDENTIALS.oldestVersion();
+             version <= ApiKeys.ALTER_USER_SCRAM_CREDENTIALS.latestVersion(); version++) {
+            AlterUserScramCredentialsRequest request = builder.build(version);
+            assertEquals(expected, request.toString());
+            assertEquals(expected, request.toString(false));
+            // The request data and the data sent on the wire are not masked
+            assertArrayEquals(salt, request.data().upsertions().get(0).salt());
+            assertArrayEquals(saltedPassword, request.data().upsertions().get(0).saltedPassword());
+            AlterUserScramCredentialsRequest parsed = AlterUserScramCredentialsRequest.parse(request.serialize(), version);
+            assertArrayEquals(salt, parsed.data().upsertions().get(0).salt());
+            assertArrayEquals(saltedPassword, parsed.data().upsertions().get(0).saltedPassword());
+        }
+    }
+
+    @Test
+    public void testDelegationTokenRequestsToStringMaskHmac() {
+        byte[] hmac = "secret-hmac".getBytes(StandardCharsets.UTF_8);
+        String hmacString = Arrays.toString(hmac);
+
+        ExpireDelegationTokenRequest.Builder expireBuilder = new ExpireDelegationTokenRequest.Builder(
+                new ExpireDelegationTokenRequestData().setHmac(hmac).setExpiryTimePeriodMs(1000L));
+        assertTrue(expireBuilder.toString().contains("hmac=[]"));
+        assertFalse(expireBuilder.toString().contains(hmacString));
+        for (short version = ApiKeys.EXPIRE_DELEGATION_TOKEN.oldestVersion();
+             version <= ApiKeys.EXPIRE_DELEGATION_TOKEN.latestVersion(); version++) {
+            ExpireDelegationTokenRequest request = expireBuilder.build(version);
+            for (String str : asList(request.toString(), request.toString(false))) {
+                assertTrue(str.contains("hmac=[]"));
+                assertTrue(str.contains("expiryTimePeriodMs=1000"));
+                assertFalse(str.contains(hmacString));
+            }
+            // The request data and the data sent on the wire are not masked
+            assertEquals(ByteBuffer.wrap(hmac), request.hmac());
+            assertEquals(ByteBuffer.wrap(hmac), ExpireDelegationTokenRequest.parse(request.serialize(), version).hmac());
+        }
+
+        RenewDelegationTokenRequest.Builder renewBuilder = new RenewDelegationTokenRequest.Builder(
+                new RenewDelegationTokenRequestData().setHmac(hmac).setRenewPeriodMs(1000L));
+        assertTrue(renewBuilder.toString().contains("hmac=[]"));
+        assertFalse(renewBuilder.toString().contains(hmacString));
+        for (short version = ApiKeys.RENEW_DELEGATION_TOKEN.oldestVersion();
+             version <= ApiKeys.RENEW_DELEGATION_TOKEN.latestVersion(); version++) {
+            RenewDelegationTokenRequest request = renewBuilder.build(version);
+            for (String str : asList(request.toString(), request.toString(false))) {
+                assertTrue(str.contains("hmac=[]"));
+                assertTrue(str.contains("renewPeriodMs=1000"));
+                assertFalse(str.contains(hmacString));
+            }
+            // The request data and the data sent on the wire are not masked
+            assertArrayEquals(hmac, request.data().hmac());
+            assertArrayEquals(hmac, RenewDelegationTokenRequest.parse(request.serialize(), version).data().hmac());
+        }
+    }
+
+    @Test
+    public void testDelegationTokenResponsesToStringMaskTokenIdAndHmac() {
+        String secretTokenId = "secret-token-id";
+        byte[] hmac = "secret-hmac".getBytes(StandardCharsets.UTF_8);
+        String hmacString = Arrays.toString(hmac);
+        KafkaPrincipal owner = SecurityUtils.parseKafkaPrincipal("User:owner");
+
+        CreateDelegationTokenResponse createResponse = CreateDelegationTokenResponse.prepareResponse(20, Errors.NONE,
+                owner, 1L, 2L, 3L, secretTokenId, ByteBuffer.wrap(hmac));
+        String createResponseStr = createResponse.toString();
+        assertTrue(createResponseStr.contains("tokenId='REDACTED'"));
+        assertTrue(createResponseStr.contains("hmac=[]"));
+        assertTrue(createResponseStr.contains("principalType='User', principalName='owner'"));
+        assertFalse(createResponseStr.contains(secretTokenId));
+        assertFalse(createResponseStr.contains(hmacString));
+        // The response data and the data sent on the wire are not masked
+        assertEquals(secretTokenId, createResponse.data().tokenId());
+        assertArrayEquals(hmac, createResponse.data().hmac());
+        for (short version = ApiKeys.CREATE_DELEGATION_TOKEN.oldestVersion();
+             version <= ApiKeys.CREATE_DELEGATION_TOKEN.latestVersion(); version++) {
+            CreateDelegationTokenResponse parsed = CreateDelegationTokenResponse.parse(
+                    createResponse.serialize(version), version);
+            assertEquals(secretTokenId, parsed.data().tokenId());
+            assertArrayEquals(hmac, parsed.data().hmac());
+        }
+
+        List<DelegationToken> tokens = asList(
+                new DelegationToken(new TokenInformation(secretTokenId + "-1", owner, singletonList(owner),
+                        1L, 2L, 3L), hmac),
+                new DelegationToken(new TokenInformation(secretTokenId + "-2", owner, singletonList(owner),
+                        1L, 2L, 3L), hmac));
+        DescribeDelegationTokenResponse describeResponse = new DescribeDelegationTokenResponse(20, Errors.NONE, tokens);
+        String describeResponseStr = describeResponse.toString();
+        assertFalse(describeResponseStr.contains(secretTokenId));
+        assertFalse(describeResponseStr.contains(hmacString));
+        String[] parts = describeResponseStr.split(",");
+        // The 2 token info should both be redacted
+        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("tokenId='REDACTED'")).count());
+        assertEquals(2, Arrays.stream(parts).filter(s -> s.trim().contains("hmac=[]")).count());
+        // The response data and the data sent on the wire are not masked
+        assertEquals(secretTokenId + "-1", describeResponse.tokens().get(0).tokenInfo().tokenId());
+        assertArrayEquals(hmac, describeResponse.tokens().get(1).hmac());
+        for (short version = ApiKeys.DESCRIBE_DELEGATION_TOKEN.oldestVersion();
+             version <= ApiKeys.DESCRIBE_DELEGATION_TOKEN.latestVersion(); version++) {
+            DescribeDelegationTokenResponse parsed = DescribeDelegationTokenResponse.parse(
+                    describeResponse.serialize(version), version);
+            assertEquals(secretTokenId + "-1", parsed.tokens().get(0).tokenInfo().tokenId());
+            assertEquals(secretTokenId + "-2", parsed.tokens().get(1).tokenInfo().tokenId());
+            assertArrayEquals(hmac, parsed.tokens().get(1).hmac());
+        }
     }
 }

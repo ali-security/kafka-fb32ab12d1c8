@@ -19,6 +19,7 @@ package org.apache.kafka.clients;
 import org.apache.kafka.common.Cluster;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.Node;
+import org.apache.kafka.common.config.ConfigResource;
 import org.apache.kafka.common.errors.AuthenticationException;
 import org.apache.kafka.common.errors.UnsupportedVersionException;
 import org.apache.kafka.common.internals.ClusterResourceListeners;
@@ -26,19 +27,24 @@ import org.apache.kafka.common.message.ApiMessageType;
 import org.apache.kafka.common.message.ApiVersionsResponseData;
 import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersion;
 import org.apache.kafka.common.message.ApiVersionsResponseData.ApiVersionCollection;
+import org.apache.kafka.common.message.CreateDelegationTokenRequestData;
 import org.apache.kafka.common.message.ProduceRequestData;
 import org.apache.kafka.common.message.ProduceResponseData;
 import org.apache.kafka.common.network.NetworkReceive;
 import org.apache.kafka.common.protocol.ApiKeys;
 import org.apache.kafka.common.protocol.Errors;
 import org.apache.kafka.common.requests.AbstractResponse;
+import org.apache.kafka.common.requests.AlterConfigsRequest;
 import org.apache.kafka.common.requests.ApiVersionsResponse;
+import org.apache.kafka.common.requests.CreateDelegationTokenRequest;
+import org.apache.kafka.common.requests.CreateDelegationTokenResponse;
 import org.apache.kafka.common.requests.MetadataRequest;
 import org.apache.kafka.common.requests.MetadataResponse;
 import org.apache.kafka.common.requests.ProduceRequest;
 import org.apache.kafka.common.requests.ProduceResponse;
 import org.apache.kafka.common.requests.RequestHeader;
 import org.apache.kafka.common.requests.RequestTestUtils;
+import org.apache.kafka.common.security.auth.KafkaPrincipal;
 import org.apache.kafka.common.security.authenticator.SaslClientAuthenticator;
 import org.apache.kafka.common.utils.LogContext;
 import org.apache.kafka.common.utils.MockTime;
@@ -47,15 +53,19 @@ import org.apache.kafka.test.MockSelector;
 import org.apache.kafka.test.TestUtils;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
+import org.mockito.stubbing.Answer;
+import org.slf4j.Logger;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -63,6 +73,7 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
 import static org.apache.kafka.common.protocol.ApiKeys.PRODUCE;
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
@@ -71,6 +82,9 @@ import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assertions.fail;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 public class NetworkClientTest {
 
@@ -1095,6 +1109,73 @@ public class NetworkClientTest {
         while (!client.ready(node0, time.milliseconds()))
             client.poll(1, time.milliseconds());
         assertTrue(client.isReady(node0, time.milliseconds()));
+    }
+
+    @Test
+    public void testSensitiveRequestAndResponseFieldsAreNotLogged() {
+        // Record every argument passed to the client's loggers, with all log levels enabled
+        List<String> loggedArguments = new ArrayList<>();
+        Answer<Object> recordArguments = invocation -> {
+            Class<?> returnType = invocation.getMethod().getReturnType();
+            if (returnType == boolean.class)
+                return true;
+            if (returnType == String.class)
+                return "recording-logger";
+            for (Object argument : invocation.getArguments())
+                loggedArguments.add(argument instanceof Object[] ?
+                        Arrays.deepToString((Object[]) argument) : String.valueOf(argument));
+            return null;
+        };
+        Logger recordingLogger = mock(Logger.class, recordArguments);
+        LogContext logContext = mock(LogContext.class);
+        when(logContext.logger(any())).thenReturn(recordingLogger);
+        NetworkClient loggingClient = new NetworkClient(selector, metadataUpdater, "mock", Integer.MAX_VALUE,
+                reconnectBackoffMsTest, reconnectBackoffMaxMsTest, 64 * 1024, 64 * 1024,
+                defaultRequestTimeoutMs, connectionSetupTimeoutMsTest, connectionSetupTimeoutMaxMsTest,
+                ClientDnsLookup.DEFAULT, time, true, new ApiVersions(), logContext);
+        awaitReady(loggingClient, node);
+
+        // CreateDelegationTokenResponse carries the token id and hmac
+        String secretTokenId = "secret-token-id";
+        byte[] secretHmac = "secret-hmac".getBytes(StandardCharsets.UTF_8);
+        ClientRequest tokenRequest = loggingClient.newClientRequest(node.idString(),
+                new CreateDelegationTokenRequest.Builder(new CreateDelegationTokenRequestData().setMaxLifetimeMs(-1L)),
+                time.milliseconds(), true);
+        loggingClient.send(tokenRequest, time.milliseconds());
+        loggingClient.poll(1, time.milliseconds());
+        CreateDelegationTokenResponse tokenResponse = CreateDelegationTokenResponse.prepareResponse(0, Errors.NONE,
+                new KafkaPrincipal(KafkaPrincipal.USER_TYPE, "user1"), 1L, 2L, 3L, secretTokenId,
+                ByteBuffer.wrap(secretHmac));
+        ByteBuffer buffer = RequestTestUtils.serializeResponseWithHeader(tokenResponse,
+                ApiKeys.CREATE_DELEGATION_TOKEN.latestVersion(), tokenRequest.correlationId());
+        selector.completeReceive(new NetworkReceive(node.idString(), buffer));
+        List<ClientResponse> responses = loggingClient.poll(1, time.milliseconds());
+        assertEquals(1, responses.size());
+        // The response handed to the caller is not masked
+        CreateDelegationTokenResponse receivedTokenResponse = (CreateDelegationTokenResponse) responses.get(0).responseBody();
+        assertEquals(secretTokenId, receivedTokenResponse.data().tokenId());
+        assertArrayEquals(secretHmac, receivedTokenResponse.data().hmac());
+        selector.clear();
+
+        // AlterConfigsRequest carries config values such as passwords
+        String secretConfigValue = "secret-config-value";
+        Map<ConfigResource, AlterConfigsRequest.Config> configs = Collections.singletonMap(
+                new ConfigResource(ConfigResource.Type.BROKER, "0"),
+                new AlterConfigsRequest.Config(Collections.singletonList(
+                        new AlterConfigsRequest.ConfigEntry("ssl.keystore.password", secretConfigValue))));
+        ClientRequest alterConfigsRequest = loggingClient.newClientRequest(node.idString(),
+                new AlterConfigsRequest.Builder(configs, false), time.milliseconds(), true);
+        loggingClient.send(alterConfigsRequest, time.milliseconds());
+        loggingClient.poll(1, time.milliseconds());
+
+        // The request and the response were logged, with their sensitive fields masked
+        assertTrue(loggedArguments.stream().anyMatch(s -> s.contains("tokenId='REDACTED'")));
+        assertTrue(loggedArguments.stream().anyMatch(s -> s.contains("value='REDACTED'")));
+        for (String logged : loggedArguments) {
+            assertFalse(logged.contains(secretTokenId), "Token id should not be logged: " + logged);
+            assertFalse(logged.contains(Arrays.toString(secretHmac)), "Token hmac should not be logged: " + logged);
+            assertFalse(logged.contains(secretConfigValue), "Config value should not be logged: " + logged);
+        }
     }
 
     private RequestHeader parseHeader(ByteBuffer buffer) {
