@@ -32,15 +32,24 @@ public interface Readable {
     int readInt();
     long readLong();
     double readDouble();
-    void readArray(byte[] arr);
+    byte[] readArray(int length);
     int readUnsignedVarint();
     ByteBuffer readByteBuffer(int length);
     int readVarint();
     long readVarlong();
+    int remaining();
+
+    /**
+     * Kept from 2.8.1 so classes compiled against it (the generated messages in kafka-streams,
+     * kafka-raft, kafka-metadata and kafka 2.8.1) still link against this kafka-clients.
+     */
+    default void readArray(byte[] arr) {
+        byte[] data = readArray(arr.length);
+        System.arraycopy(data, 0, arr, 0, arr.length);
+    }
 
     default String readString(int length) {
-        byte[] arr = new byte[length];
-        readArray(arr);
+        byte[] arr = readArray(length);
         return new String(arr, StandardCharsets.UTF_8);
     }
 
@@ -48,8 +57,7 @@ public interface Readable {
         if (unknowns == null) {
             unknowns = new ArrayList<>();
         }
-        byte[] data = new byte[size];
-        readArray(data);
+        byte[] data = readArray(size);
         unknowns.add(new RawTaggedField(tag, data));
         return unknowns;
     }
